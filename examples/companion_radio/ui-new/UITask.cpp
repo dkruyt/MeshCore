@@ -1,5 +1,9 @@
 #include "UITask.h"
+#include <math.h>
 #include <helpers/TxtDataHelpers.h>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 #include "../MyMesh.h"
 #include "target.h"
 
@@ -81,6 +85,7 @@ class HomeScreen : public UIScreen {
     ADVERT,
 #if ENV_INCLUDE_GPS == 1
     GPS,
+    RADAR,
 #endif
 #if UI_SENSORS_PAGE == 1
     SENSORS,
@@ -96,6 +101,31 @@ class HomeScreen : public UIScreen {
   uint8_t _page;
   bool _shutdown_init;
   AdvertPath recent[UI_RECENT_LIST_SIZE];
+  int8_t rssi_history[32];
+  int8_t noise_history[32];
+  uint8_t graph_idx;
+  unsigned long next_graph_sample;
+
+  float calculateBearing(float lat1, float lon1, float lat2, float lon2) {
+    float dLon = (lon2 - lon1) * M_PI / 180.0;
+    lat1 = lat1 * M_PI / 180.0;
+    lat2 = lat2 * M_PI / 180.0;
+    float y = sin(dLon) * cos(lat2);
+    float x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLon);
+    float brng = atan2(y, x) * 180.0 / M_PI;
+    return brng;
+  }
+
+  float calculateDistance(float lat1, float lon1, float lat2, float lon2) {
+    float dLat = (lat2 - lat1) * M_PI / 180.0;
+    float dLon = (lon2 - lon1) * M_PI / 180.0;
+    lat1 = lat1 * M_PI / 180.0;
+    lat2 = lat2 * M_PI / 180.0;
+    float a = sin(dLat / 2) * sin(dLat / 2) +
+              sin(dLon / 2) * sin(dLon / 2) * cos(lat1) * cos(lat2);
+    float c = 2 * atan2(sqrt(a), sqrt(1 - a));
+    return 6371000 * c; // Earth radius in meters
+  }
 
 
   void renderBatteryIndicator(DisplayDriver& display, uint16_t batteryMilliVolts) {
@@ -154,11 +184,23 @@ class HomeScreen : public UIScreen {
 public:
   HomeScreen(UITask* task, mesh::RTCClock* rtc, SensorManager* sensors, NodePrefs* node_prefs)
      : _task(task), _rtc(rtc), _sensors(sensors), _node_prefs(node_prefs), _page(0), 
-       _shutdown_init(false), sensors_lpp(200) {  }
+       _shutdown_init(false), sensors_lpp(200) {
+         memset(rssi_history, -120, sizeof(rssi_history));
+         memset(noise_history, -120, sizeof(noise_history));
+         graph_idx = 0;
+         next_graph_sample = 0;
+  }
 
   void poll() override {
     if (_shutdown_init && !_task->isButtonPressed()) {  // must wait for USR button to be released
       _task->shutdown();
+    }
+
+    if (millis() > next_graph_sample) {
+      rssi_history[graph_idx] = (int8_t)radio_driver.getLastRSSI();
+      noise_history[graph_idx] = (int8_t)radio_driver.getNoiseFloor();
+      graph_idx = (graph_idx + 1) % 32;
+      next_graph_sample = millis() + 1000;
     }
   }
 
@@ -230,22 +272,64 @@ public:
     } else if (_page == HomePage::RADIO) {
       display.setColor(DisplayDriver::YELLOW);
       display.setTextSize(1);
-      // freq / sf
-      display.setCursor(0, 20);
-      sprintf(tmp, "FQ: %06.3f   SF: %d", _node_prefs->freq, _node_prefs->sf);
+      
+      // Compact text info
+      display.setCursor(0, 18);
+      sprintf(tmp, "%.3f SF:%d CR:%d", _node_prefs->freq, _node_prefs->sf, _node_prefs->cr);
+      display.print(tmp);
+      
+      display.setCursor(0, 26);
+      sprintf(tmp, "BW:%.0f TX:%d Nf:%d", _node_prefs->bw, _node_prefs->tx_power_dbm, radio_driver.getNoiseFloor());
       display.print(tmp);
 
-      display.setCursor(0, 31);
-      sprintf(tmp, "BW: %03.2f     CR: %d", _node_prefs->bw, _node_prefs->cr);
-      display.print(tmp);
+      // Draw Graph
+      int graph_y = 35;
+      int graph_h = 28;
+      int graph_w = 128; 
+      int min_val = -130;
+      int max_val = -30;
+      int range = max_val - min_val;
 
-      // tx power,  noise floor
-      display.setCursor(0, 42);
-      sprintf(tmp, "TX: %ddBm", _node_prefs->tx_power_dbm);
-      display.print(tmp);
-      display.setCursor(0, 53);
-      sprintf(tmp, "Noise floor: %d", radio_driver.getNoiseFloor());
-      display.print(tmp);
+      // Draw box
+      display.setColor(DisplayDriver::DARK);
+      display.fillRect(0, graph_y, graph_w, graph_h);
+      display.setColor(DisplayDriver::LIGHT);
+      display.drawRect(0, graph_y, graph_w, graph_h);
+
+      // Plot data
+      int x_step = graph_w / 32;
+      int prev_x = -1, prev_y = -1;
+
+      for (int i = 0; i < 32; i++) {
+        int idx = (graph_idx + i) % 32;
+        int val = rssi_history[idx];
+        
+        if (val < min_val) val = min_val;
+        if (val > max_val) val = max_val;
+        
+        int h = ((val - min_val) * (graph_h - 2)) / range;
+        int x = i * x_step;
+        int y = graph_y + graph_h - 1 - h;
+        
+        // draw line from prev
+        if (i > 0 && prev_x != -1) {
+           // Bresenham's line algorithm
+           int x0 = prev_x, y0 = prev_y;
+           int x1 = x, y1 = y;
+           int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+           int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+           int err = dx + dy, e2;
+           for (;;) {
+             display.fillRect(x0, y0, 1, 1);
+             if (x0 == x1 && y0 == y1) break;
+             e2 = 2 * err;
+             if (e2 >= dy) { err += dy; x0 += sx; }
+             if (e2 <= dx) { err += dx; y0 += sy; }
+           }
+        }
+        prev_x = x; prev_y = y;
+      }
+      return 1000;
     } else if (_page == HomePage::BLUETOOTH) {
       display.setColor(DisplayDriver::GREEN);
       display.drawXbm((display.width() - 32) / 2, 18,
@@ -295,6 +379,60 @@ public:
         display.drawTextRightAlign(display.width()-1, y, buf);
         y = y + 12;
       }
+    } else if (_page == HomePage::RADAR) {
+      display.setColor(DisplayDriver::GREEN);
+      int cx = display.width() / 2;
+      int cy = 38;
+      int r = 18;
+      
+      // Draw radar crosshair
+      display.drawRect(cx - r, cy - r, r*2, r*2);
+      display.fillRect(cx, cy - r, 1, r*2);
+      display.fillRect(cx - r, cy, r*2, 1);
+      
+      // Get my location
+      double my_lat = _sensors->node_lat;
+      double my_lon = _sensors->node_lon;
+      
+      // Find target contact
+      ContactInfo target;
+      bool found = false;
+      for (int i = 0; i < the_mesh.getNumContacts(); i++) {
+        if (the_mesh.getContactByIdx(i, target)) {
+          if (target.gps_lat != 0 || target.gps_lon != 0) {
+            found = true;
+            break;
+          }
+        }
+      }
+      
+      if (found && my_lat != 0) {
+        float lat2 = target.gps_lat / 1000000.0;
+        float lon2 = target.gps_lon / 1000000.0;
+        float dist = calculateDistance(my_lat, my_lon, lat2, lon2);
+        float brng = calculateBearing(my_lat, my_lon, lat2, lon2);
+        
+        // Draw target on radar
+        float rad = brng * M_PI / 180.0;
+        int tx = cx + sin(rad) * (r - 2);
+        int ty = cy - cos(rad) * (r - 2);
+        display.setColor(DisplayDriver::YELLOW);
+        display.fillRect(tx - 1, ty - 1, 3, 3);
+        
+        display.setTextSize(1);
+        display.setColor(DisplayDriver::LIGHT);
+        display.drawTextCentered(cx, 15, target.name);
+        if (dist > 1000) {
+          sprintf(tmp, "%.1fkm", dist / 1000.0);
+        } else {
+          sprintf(tmp, "%.0fm", dist);
+        }
+        display.drawTextCentered(cx, 56, tmp);
+      } else {
+        display.setTextSize(1);
+        display.drawTextCentered(cx, 34, "No GPS targets");
+      }
+      return 2000;
 #endif
 #if UI_SENSORS_PAGE == 1
     } else if (_page == HomePage::SENSORS) {
