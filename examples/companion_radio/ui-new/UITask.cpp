@@ -96,6 +96,10 @@ class HomeScreen : public UIScreen {
   uint8_t _page;
   bool _shutdown_init;
   AdvertPath recent[UI_RECENT_LIST_SIZE];
+  int8_t rssi_history[32];
+  int8_t noise_history[32];
+  uint8_t graph_idx;
+  unsigned long next_graph_sample;
 
 
   void renderBatteryIndicator(DisplayDriver& display, uint16_t batteryMilliVolts) {
@@ -154,11 +158,23 @@ class HomeScreen : public UIScreen {
 public:
   HomeScreen(UITask* task, mesh::RTCClock* rtc, SensorManager* sensors, NodePrefs* node_prefs)
      : _task(task), _rtc(rtc), _sensors(sensors), _node_prefs(node_prefs), _page(0), 
-       _shutdown_init(false), sensors_lpp(200) {  }
+       _shutdown_init(false), sensors_lpp(200) {
+         memset(rssi_history, -120, sizeof(rssi_history));
+         memset(noise_history, -120, sizeof(noise_history));
+         graph_idx = 0;
+         next_graph_sample = 0;
+  }
 
   void poll() override {
     if (_shutdown_init && !_task->isButtonPressed()) {  // must wait for USR button to be released
       _task->shutdown();
+    }
+
+    if (millis() > next_graph_sample) {
+      rssi_history[graph_idx] = (int8_t)radio_driver.getLastRSSI();
+      noise_history[graph_idx] = (int8_t)radio_driver.getNoiseFloor();
+      graph_idx = (graph_idx + 1) % 32;
+      next_graph_sample = millis() + 1000;
     }
   }
 
@@ -230,22 +246,64 @@ public:
     } else if (_page == HomePage::RADIO) {
       display.setColor(DisplayDriver::YELLOW);
       display.setTextSize(1);
-      // freq / sf
-      display.setCursor(0, 20);
-      sprintf(tmp, "FQ: %06.3f   SF: %d", _node_prefs->freq, _node_prefs->sf);
+      
+      // Compact text info
+      display.setCursor(0, 18);
+      sprintf(tmp, "%.3f SF:%d CR:%d", _node_prefs->freq, _node_prefs->sf, _node_prefs->cr);
+      display.print(tmp);
+      
+      display.setCursor(0, 26);
+      sprintf(tmp, "BW:%.0f TX:%d Nf:%d", _node_prefs->bw, _node_prefs->tx_power_dbm, radio_driver.getNoiseFloor());
       display.print(tmp);
 
-      display.setCursor(0, 31);
-      sprintf(tmp, "BW: %03.2f     CR: %d", _node_prefs->bw, _node_prefs->cr);
-      display.print(tmp);
+      // Draw Graph
+      int graph_y = 35;
+      int graph_h = 28;
+      int graph_w = 128; 
+      int min_val = -130;
+      int max_val = -30;
+      int range = max_val - min_val;
 
-      // tx power,  noise floor
-      display.setCursor(0, 42);
-      sprintf(tmp, "TX: %ddBm", _node_prefs->tx_power_dbm);
-      display.print(tmp);
-      display.setCursor(0, 53);
-      sprintf(tmp, "Noise floor: %d", radio_driver.getNoiseFloor());
-      display.print(tmp);
+      // Draw box
+      display.setColor(DisplayDriver::DARK);
+      display.fillRect(0, graph_y, graph_w+2, graph_h);
+      display.setColor(DisplayDriver::LIGHT);
+      display.drawRect(0, graph_y, graph_w+2, graph_h);
+
+      // Plot data
+      int x_step = graph_w / 32;
+      int prev_x = -1, prev_y = -1;
+
+      for (int i = 0; i < 32; i++) {
+        int idx = (graph_idx + i) % 32;
+        int val = rssi_history[idx];
+        
+        if (val < min_val) val = min_val;
+        if (val > max_val) val = max_val;
+        
+        int h = ((val - min_val) * (graph_h - 2)) / range;
+        int x = 1 + i * x_step;
+        int y = graph_y + graph_h - 1 - h;
+        
+        // draw line from prev
+        if (i > 0 && prev_x != -1) {
+           // Bresenham's line algorithm
+           int x0 = prev_x, y0 = prev_y;
+           int x1 = x, y1 = y;
+           int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+           int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+           int err = dx + dy, e2;
+           for (;;) {
+             display.fillRect(x0, y0, 1, 1);
+             if (x0 == x1 && y0 == y1) break;
+             e2 = 2 * err;
+             if (e2 >= dy) { err += dy; x0 += sx; }
+             if (e2 <= dx) { err += dx; y0 += sy; }
+           }
+        }
+        prev_x = x; prev_y = y;
+      }
+      return 1000;
     } else if (_page == HomePage::BLUETOOTH) {
       display.setColor(DisplayDriver::GREEN);
       display.drawXbm((display.width() - 32) / 2, 18,
