@@ -77,6 +77,7 @@ class HomeScreen : public UIScreen {
     FIRST,
     RECENT,
     RADIO,
+    SIGNAL_DASH,
     BLUETOOTH,
     ADVERT,
     DISPLAY_SETTINGS,
@@ -247,6 +248,44 @@ public:
       display.setCursor(0, 53);
       sprintf(tmp, "Noise floor: %d", radio_driver.getNoiseFloor());
       display.print(tmp);
+    } else if (_page == HomePage::SIGNAL_DASH) {
+      display.setColor(DisplayDriver::YELLOW);
+      display.setTextSize(1);
+      display.setCursor(0, 0);
+      display.print("Signal Search");
+
+      // latest values (from prev index)
+      int latest_idx = (_task->signal_idx + 20 - 1) % 20;
+      float last_rssi = _task->signal_history[latest_idx].rssi;
+      float last_snr = _task->signal_history[latest_idx].snr;
+      
+      display.setCursor(0, 12);
+      sprintf(tmp, "RSSI: %d  SNR: %.1f", (int)last_rssi, last_snr);
+      display.print(tmp);
+
+      // Draw Graph
+      int graph_h = 40;
+      int graph_y = 63;
+      int bar_w = 4;
+      
+      display.setColor(DisplayDriver::GREEN);
+      display.drawRect(0, graph_y - graph_h, 20 * bar_w + 2, graph_h + 1); // border
+
+      // draw bars
+      for (int i = 0; i < 20; i++) {
+        int idx = (_task->signal_idx + i) % 20; // start from oldest
+        float s = _task->signal_history[idx].snr;
+        if (s == 0 && _task->signal_history[idx].rssi == 0) continue; // empty slot
+
+        // Map SNR -20..+10 to 0..graph_h
+        // or RSSI -120..-40
+        int h = (int)((s + 20.0f) * (graph_h / 30.0f)); 
+        if (h < 1) h = 1;
+        if (h > graph_h) h = graph_h;
+
+        int x = 1 + (i * bar_w);
+        display.fillRect(x, graph_y - h, bar_w - 1, h);
+      }
     } else if (_page == HomePage::BLUETOOTH) {
       display.setColor(DisplayDriver::GREEN);
       display.drawXbm((display.width() - 32) / 2, 18,
@@ -869,6 +908,12 @@ char UITask::handleTripleClick(char c) {
   toggleBuzzer();
   c = 0;
   return c;
+}
+
+void UITask::onSignalRecv(float snr, float rssi) {
+  signal_history[signal_idx].rssi = rssi;
+  signal_history[signal_idx].snr = snr;
+  signal_idx = (signal_idx + 1) % 20;
 }
 
 bool UITask::getGPSState() {

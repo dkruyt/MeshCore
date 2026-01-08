@@ -19,6 +19,15 @@
 #include "../NodePrefs.h"
 
 class UITask : public AbstractUITask {
+  friend class HomeScreen;
+
+  struct SignalStats {
+    float rssi;
+    float snr;
+  };
+  SignalStats signal_history[20];
+  int signal_idx = 0;
+
   DisplayDriver* _display;
   SensorManager* _sensors;
 #ifdef PIN_BUZZER
@@ -78,6 +87,7 @@ public:
   bool getGPSState();
   void toggleGPS();
 
+  void onSignalRecv(float snr, float rssi) override;
 
   // from AbstractUITask
   void msgRead(int msgcount) override;
